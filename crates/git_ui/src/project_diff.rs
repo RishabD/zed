@@ -17,12 +17,15 @@ use futures_lite::future::yield_now;
 use git::repository::DiffType;
 
 use git::{
-    Commit, StageAll, StageAndNext, ToggleStaged, UnstageAll, UnstageAndNext, repository::RepoPath,
+    Commit, StageAll, StageAndNext, ToggleStaged, UnstageAll, UnstageAndNext,
+    repository::RepoPath,
+    repository::{CommitDetails, RepoPath},
     status::FileStatus,
 };
 use gpui::{
-    Action, AnyElement, App, AppContext as _, AsyncWindowContext, Entity, EventEmitter,
-    FocusHandle, Focusable, Render, Subscription, Task, WeakEntity, actions,
+    Action, AnyElement, App, AppContext as _, AsyncWindowContext, DismissEvent, Entity,
+    EventEmitter, FocusHandle, Focusable, Render, SharedString, Subscription, Task, WeakEntity,
+    actions,
 };
 use language::{Anchor, Buffer, BufferId, Capability, OffsetRangeExt};
 use multi_buffer::{MultiBuffer, PathKey};
@@ -40,9 +43,10 @@ use theme::ActiveTheme;
 use ui::{DiffStat, Divider, KeyBinding, Tooltip, prelude::*, vertical_divider};
 use util::{ResultExt as _, rel_path::RelPath};
 use workspace::{
-    CloseActiveItem, ItemNavHistory, SerializableItem, ToolbarItemEvent, ToolbarItemLocation,
-    ToolbarItemView, Workspace,
+    CloseActiveItem, ItemNavHistory, ModalView, SerializableItem, Toast, ToolbarItemEvent,
+    ToolbarItemLocation, ToolbarItemView, Workspace,
     item::{Item, ItemEvent, ItemHandle, SaveOptions, TabContentParams},
+    notifications::NotificationId,
     notifications::NotifyTaskExt,
     searchable::SearchableItemHandle,
 };
@@ -59,6 +63,8 @@ actions!(
         /// Shows the diff between the working directory and your default
         /// branch (typically main or master).
         BranchDiff,
+        /// Shows the diff between the working directory and a provided git ref.
+        BranchDiffAgainst,
         /// Opens a new agent thread with the branch diff for review.
         ReviewDiff,
         LeaderAndFollower,
@@ -94,6 +100,7 @@ impl ProjectDiff {
     pub(crate) fn register(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
         workspace.register_action(Self::deploy);
         workspace.register_action(Self::deploy_branch_diff);
+        workspace.register_action(Self::deploy_branch_diff_against);
         workspace.register_action(|workspace, _: &Add, window, cx| {
             Self::deploy(workspace, &Diff, window, cx);
         });
@@ -135,6 +142,67 @@ impl ProjectDiff {
                     })?
                     .await?;
                 workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        workspace.add_item_to_active_pane(Box::new(this), None, true, window, cx);
+                    })
+                    .ok();
+                anyhow::Ok(())
+            })
+            .detach_and_notify_err(workspace_weak, window, cx);
+    }
+
+    fn deploy_branch_diff_against(
+        workspace: &mut Workspace,
+        _: &BranchDiffAgainst,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let Some(repo) = workspace.project().read(cx).active_repository(cx) else {
+            return;
+        };
+
+        let workspace_handle = cx.entity();
+        workspace.toggle_modal(window, cx, |window, cx| {
+            BranchDiffRefModal::new(repo, workspace_handle, window, cx)
+        });
+    }
+
+    fn deploy_branch_diff_for_ref(
+        workspace: &mut Workspace,
+        base_ref: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        telemetry::event!("Git Branch Diff Opened", base_ref = base_ref.as_ref());
+        let project = workspace.project().clone();
+
+        let existing = workspace.items_of_type::<Self>(cx).find(|item| {
+            matches!(
+                item.read(cx).diff_base(cx),
+                DiffBase::Merge { base_ref: existing_ref } if existing_ref == &base_ref
+            )
+        });
+        if let Some(existing) = existing {
+            workspace.activate_item(&existing, true, true, window, cx);
+            return;
+        }
+
+        let workspace_handle = cx.entity();
+        let workspace_weak = workspace_handle.downgrade();
+        window
+            .spawn(cx, async move |cx| {
+                let this = cx
+                    .update(|window, cx| {
+                        Self::new_with_base_ref(
+                            project,
+                            workspace_handle.clone(),
+                            base_ref,
+                            window,
+                            cx,
+                        )
+                    })?
+                    .await?;
+                workspace_handle
                     .update_in(cx, |workspace, window, cx| {
                         workspace.add_item_to_active_pane(Box::new(this), None, true, window, cx);
                     })
@@ -307,11 +375,27 @@ impl ProjectDiff {
                 .await??
                 .context("Could not determine default branch")?;
 
+            cx.update(|window, cx| {
+                Self::new_with_base_ref(project, workspace, main_branch, window, cx)
+            })?
+            .await
+        })
+    }
+
+    fn new_with_base_ref(
+        project: Entity<Project>,
+        workspace: Entity<Workspace>,
+        base_ref: SharedString,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Entity<Self>>> {
+        window.spawn(cx, async move |cx| {
             let branch_diff = cx.new_window_entity(|window, cx| {
                 branch_diff::BranchDiff::new(
                     DiffBase::Merge {
                         base_ref: main_branch,
                     },
+                    DiffBase::Merge { base_ref },
                     project.clone(),
                     window,
                     cx,
@@ -1311,6 +1395,199 @@ mod persistence {
             };
             serde_json::from_str(&diff_base_str).context("deserializing diff base")
         }
+    }
+}
+
+struct BranchDiffRefModal {
+    editor: Entity<Editor>,
+    repo: Entity<Repository>,
+    workspace: Entity<Workspace>,
+    commit: Option<CommitDetails>,
+    lookup_task: Option<Task<()>>,
+    _editor_subscription: Subscription,
+}
+
+impl BranchDiffRefModal {
+    fn new(
+        repo: Entity<Repository>,
+        workspace: Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Enter branch name or commit SHA...", window, cx);
+            editor
+        });
+
+        let _editor_subscription = cx.subscribe_in(
+            &editor,
+            window,
+            |this, _editor, event: &editor::EditorEvent, window, cx| {
+                if let editor::EditorEvent::BufferEdited = event {
+                    this.lookup_commit(window, cx);
+                }
+            },
+        );
+
+        Self {
+            editor,
+            repo,
+            workspace,
+            commit: None,
+            lookup_task: None,
+            _editor_subscription,
+        }
+    }
+
+    fn lookup_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let git_ref = self.editor.read(cx).text(cx);
+        let git_ref = git_ref.trim().to_string();
+
+        if git_ref.is_empty() {
+            self.commit = None;
+            cx.notify();
+            return;
+        }
+
+        let repo = self.repo.clone();
+        self.lookup_task = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(300))
+                .await;
+
+            let show_result = repo
+                .update(cx, |repo, _| repo.show(git_ref.clone()))
+                .await
+                .ok();
+
+            if let Some(show_future) = show_result {
+                if let Ok(details) = show_future {
+                    this.update(cx, |this, cx| {
+                        this.commit = Some(details);
+                        cx.notify();
+                    })
+                    .ok();
+                } else {
+                    this.update(cx, |this, cx| {
+                        this.commit = None;
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            }
+        }));
+    }
+
+    fn cancel(&mut self, _: &menu::Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let git_ref = self.editor.read(cx).text(cx);
+        let git_ref = git_ref.trim();
+
+        if git_ref.is_empty() {
+            cx.emit(DismissEvent);
+            return;
+        }
+
+        let git_ref_string = git_ref.to_string();
+        let repo = self.repo.clone();
+        let workspace = self.workspace.clone();
+
+        window
+            .spawn(cx, async move |cx| -> anyhow::Result<()> {
+                let show_future = repo.update(cx, |repo, _| repo.show(git_ref_string.clone()));
+                let show_result = show_future.await;
+
+                match show_result {
+                    Ok(Ok(_)) => {
+                        workspace.update_in(cx, |workspace, window, cx| {
+                            ProjectDiff::deploy_branch_diff_for_ref(
+                                workspace,
+                                git_ref_string.clone().into(),
+                                window,
+                                cx,
+                            );
+                        })?;
+                    }
+                    Ok(Err(error)) => {
+                        workspace.update(cx, |workspace, cx| {
+                            Self::show_git_error_toast(error, workspace, cx);
+                        });
+                    }
+                    Err(error) => {
+                        workspace.update(cx, |workspace, cx| {
+                            Self::show_git_error_toast(anyhow!(error.to_string()), workspace, cx);
+                        });
+                    }
+                }
+
+                Ok(())
+            })
+            .detach();
+        cx.emit(DismissEvent);
+    }
+
+    fn show_git_error_toast(
+        error: anyhow::Error,
+        workspace: &mut Workspace,
+        cx: &mut Context<Workspace>,
+    ) {
+        let toast = Toast::new(NotificationId::unique::<Self>(), error.to_string());
+        workspace.show_toast(toast, cx);
+    }
+}
+
+impl EventEmitter<DismissEvent> for BranchDiffRefModal {}
+impl ModalView for BranchDiffRefModal {}
+
+impl Focusable for BranchDiffRefModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl Render for BranchDiffRefModal {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let commit_preview = self.commit.as_ref().map(|details| {
+            let subject = details.message.lines().next().unwrap_or("").to_string();
+            let sha = details.sha.to_string();
+
+            h_flex()
+                .px_3()
+                .pb_3()
+                .w_full()
+                .justify_between()
+                .gap_3()
+                .child(
+                    Label::new(subject)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(Label::new(sha).size(LabelSize::Small).color(Color::Muted))
+        });
+
+        v_flex()
+            .key_context("BranchDiffRefModal")
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .elevation_2(cx)
+            .w(rems(34.))
+            .child(
+                h_flex()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .w_full()
+                    .gap_1p5()
+                    .child(Icon::new(IconName::GitBranch).size(IconSize::XSmall))
+                    .child(Headline::new("Branch Diff Against").size(HeadlineSize::XSmall)),
+            )
+            .child(div().px_3().w_full().child(self.editor.clone()))
+            .when_some(commit_preview, |el, preview| el.child(preview))
+            .when(self.commit.is_none(), |el| el.child(div().pb_3()))
     }
 }
 
@@ -2642,6 +2919,119 @@ mod tests {
                 )
             ])
         );
+    }
+
+    #[gpui::test]
+    async fn test_branch_diff_against_reuses_matching_ref_tab(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "working-tree\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        fs.set_head_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "head\n".into())],
+            "sha",
+        );
+        fs.set_merge_base_content_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "base\n".into())],
+        );
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            ProjectDiff::deploy_branch_diff_for_ref(workspace, "main".into(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let first_id = workspace.update(cx, |workspace, cx| {
+            workspace
+                .active_item_as::<ProjectDiff>(cx)
+                .unwrap()
+                .entity_id()
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            ProjectDiff::deploy_branch_diff_for_ref(workspace, "main".into(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let (items, active_id) = workspace.update(cx, |workspace, cx| {
+            (
+                workspace.items_of_type::<ProjectDiff>(cx).count(),
+                workspace
+                    .active_item_as::<ProjectDiff>(cx)
+                    .unwrap()
+                    .entity_id(),
+            )
+        });
+
+        assert_eq!(items, 1);
+        assert_eq!(active_id, first_id);
+    }
+
+    #[gpui::test]
+    async fn test_branch_diff_against_opens_separate_tabs_for_different_refs(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "working-tree\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        fs.set_head_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "head\n".into())],
+            "sha",
+        );
+        fs.set_merge_base_content_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "base\n".into())],
+        );
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            ProjectDiff::deploy_branch_diff_for_ref(workspace, "main".into(), window, cx);
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            ProjectDiff::deploy_branch_diff_for_ref(workspace, "HEAD".into(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let labels = workspace.update(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<ProjectDiff>(cx)
+                .map(|item| item.read(cx).tab_content_text(0, cx).to_string())
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(labels.len(), 2);
+        assert!(labels.iter().any(|label| label == "Changes since main"));
+        assert!(labels.iter().any(|label| label == "Changes since HEAD"));
     }
 
     #[gpui::test]
