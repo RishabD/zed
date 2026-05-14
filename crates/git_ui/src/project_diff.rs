@@ -1,5 +1,7 @@
 use crate::{
-    branch_picker, conflict_view,
+    branch_picker,
+    conflict_view::{self},
+    file_diff_view::FileDiffView,
     git_panel::{GitPanel, GitPanelAddon, GitStatusEntry},
     git_panel_settings::GitPanelSettings,
 };
@@ -595,6 +597,7 @@ impl ProjectDiff {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
+        let project_diff = cx.weak_entity();
         let multibuffer = cx.new(|cx| {
             let mut multibuffer = MultiBuffer::new(Capability::ReadWrite);
             multibuffer.set_all_diff_hunks_expanded(cx);
@@ -621,11 +624,13 @@ impl ProjectDiff {
                     DiffBase::Head => {
                         editor.register_addon(GitPanelAddon {
                             workspace: workspace.downgrade(),
+                            project_diff: Some(project_diff.clone()),
                         });
                     }
                     DiffBase::Merge { .. } => {
                         editor.register_addon(BranchDiffAddon {
                             branch_diff: branch_diff.clone(),
+                            project_diff: project_diff.clone(),
                         });
                     }
                 }
@@ -794,6 +799,38 @@ impl ProjectDiff {
     /// Returns a reference to the splittable editor.
     pub fn editor(&self) -> &Entity<SplittableEditor> {
         &self.editor
+    }
+
+    pub(crate) fn open_full_file_diff(
+        &mut self,
+        buffer_id: BufferId,
+        split: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let multibuffer = self.multibuffer.read(cx);
+        let Some(buffer) = multibuffer.buffer(buffer_id) else {
+            return;
+        };
+        let Some(diff) = multibuffer.diff_for(buffer_id) else {
+            return;
+        };
+        let base_label = match self.diff_base(cx) {
+            DiffBase::Head => "Base".into(),
+            DiffBase::Merge { base_ref } => base_ref.to_string().into(),
+        };
+
+        FileDiffView::open_existing_diff(
+            buffer,
+            diff,
+            base_label,
+            self.project.clone(),
+            self.workspace.clone(),
+            split,
+            window,
+            cx,
+        )
+        .detach_and_log_err(cx);
     }
 
     fn button_states(&self, cx: &App) -> ButtonStates {
@@ -2061,6 +2098,7 @@ impl Render for BranchDiffToolbar {
 
 struct BranchDiffAddon {
     branch_diff: Entity<branch_diff::BranchDiff>,
+    project_diff: WeakEntity<ProjectDiff>,
 }
 
 impl Addon for BranchDiffAddon {
@@ -2076,6 +2114,35 @@ impl Addon for BranchDiffAddon {
         self.branch_diff
             .read(cx)
             .status_for_buffer_id(buffer_id, cx)
+    }
+
+    fn render_buffer_header_actions(
+        &self,
+        _excerpt_info: &multi_buffer::ExcerptBoundaryInfo,
+        buffer: &language::BufferSnapshot,
+        _window: &Window,
+        _cx: &App,
+    ) -> Option<AnyElement> {
+        let project_diff = self.project_diff.clone();
+        let buffer_id = buffer.remote_id();
+        Some(
+            Button::new("open-diff-button", "Open Diff")
+                .style(ButtonStyle::OutlinedGhost)
+                .on_click(move |event, window, cx| {
+                    project_diff
+                        .update(cx, |project_diff, cx| {
+                            project_diff.open_full_file_diff(
+                                buffer_id,
+                                event.modifiers().secondary(),
+                                window,
+                                cx,
+                            );
+                            cx.stop_propagation();
+                        })
+                        .ok();
+                })
+                .into_any_element(),
+        )
     }
 }
 
@@ -2177,6 +2244,57 @@ mod tests {
 
         let text = String::from_utf8(fs.read_file_sync("/project/foo.txt").unwrap()).unwrap();
         assert_eq!(text, "foo\n");
+    }
+
+    #[gpui::test]
+    async fn test_open_full_file_diff_from_project_diff(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "foo.txt": "FOO\n",
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("foo.txt", "foo\n".into())],
+        );
+
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let diff = cx.new_window_entity(|window, cx| {
+            ProjectDiff::new(project.clone(), workspace.clone(), window, cx)
+        });
+        cx.run_until_parked();
+
+        let buffer_id = diff.read_with(cx, |diff, cx| {
+            diff.multibuffer
+                .read(cx)
+                .snapshot(cx)
+                .buffers_with_paths()
+                .next()
+                .unwrap()
+                .0
+                .remote_id()
+        });
+
+        cx.update_window_entity(&diff, |diff, window, cx| {
+            diff.open_full_file_diff(buffer_id, false, window, cx);
+        });
+        cx.run_until_parked();
+
+        workspace.update(cx, |workspace, cx| {
+            let diff_view = workspace
+                .active_item_as::<FileDiffView>(cx)
+                .expect("active item should be a file diff view");
+            assert_eq!(diff_view.read(cx).tab_content_text(0, cx), "Base ↔ foo.txt");
+        });
     }
 
     #[gpui::test]

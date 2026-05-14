@@ -772,6 +772,16 @@ pub trait Addon: 'static {
         None
     }
 
+    fn render_buffer_header_actions(
+        &self,
+        _: &ExcerptBoundaryInfo,
+        _: &language::BufferSnapshot,
+        _: &Window,
+        _: &App,
+    ) -> Option<AnyElement> {
+        None
+    }
+
     fn extend_buffer_header_context_menu(
         &self,
         menu: ui::ContextMenu,

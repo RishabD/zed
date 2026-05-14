@@ -6768,6 +6768,7 @@ impl EventEmitter<PanelEvent> for GitPanel {}
 
 pub(crate) struct GitPanelAddon {
     pub(crate) workspace: WeakEntity<Workspace>,
+    pub(crate) project_diff: Option<WeakEntity<ProjectDiff>>,
 }
 
 impl editor::Addon for GitPanelAddon {
@@ -6788,6 +6789,35 @@ impl editor::Addon for GitPanelAddon {
         git_panel
             .read(cx)
             .render_buffer_header_controls(&git_panel, file, window, cx)
+    }
+
+    fn render_buffer_header_actions(
+        &self,
+        _excerpt_info: &ExcerptBoundaryInfo,
+        buffer: &language::BufferSnapshot,
+        _window: &Window,
+        _cx: &App,
+    ) -> Option<AnyElement> {
+        let project_diff = self.project_diff.clone()?;
+        let buffer_id = buffer.remote_id();
+        Some(
+            Button::new("open-diff-button", "Open Diff")
+                .style(ButtonStyle::OutlinedGhost)
+                .on_click(move |event, window, cx| {
+                    project_diff
+                        .update(cx, |project_diff, cx| {
+                            project_diff.open_full_file_diff(
+                                buffer_id,
+                                event.modifiers().secondary(),
+                                window,
+                                cx,
+                            );
+                            cx.stop_propagation();
+                        })
+                        .ok();
+                })
+                .into_any_element(),
+        )
     }
 }
 

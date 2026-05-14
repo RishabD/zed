@@ -872,9 +872,19 @@ pub(crate) fn render_buffer_header(
                         .when(can_open_excerpts && relative_path.is_some(), |this| {
                             this.child(
                                 div()
+                                    .h_flex()
+                                    .gap_1()
                                     .when(!is_selected, |this| {
                                         this.visible_on_hover("buffer-header-group")
                                     })
+                                    .children(editor_read.addons.values().filter_map(|addon| {
+                                        addon.render_buffer_header_actions(
+                                            for_excerpt,
+                                            buffer,
+                                            window,
+                                            cx,
+                                        )
+                                    }))
                                     .child(
                                         Button::new("open-file-button", "Open File")
                                             .style(ButtonStyle::OutlinedGhost)

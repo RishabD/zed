@@ -1,6 +1,6 @@
 //! FileDiffView provides a UI for displaying differences between two buffers.
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use buffer_diff::BufferDiff;
 use editor::{Editor, EditorEvent, EditorSettings, MultiBuffer, SplittableEditor};
 use futures::{FutureExt, select_biased};
@@ -28,8 +28,10 @@ use workspace::{
 
 pub struct FileDiffView {
     editor: Entity<SplittableEditor>,
-    old_buffer: Entity<Buffer>,
+    old_buffer: Option<Entity<Buffer>>,
     new_buffer: Entity<Buffer>,
+    title: SharedString,
+    tooltip: Option<SharedString>,
     buffer_changes_tx: watch::Sender<()>,
     _recalculate_diff_task: Task<Result<()>>,
 }
@@ -60,12 +62,17 @@ impl FileDiffView {
             workspace.update_in(cx, |workspace, window, cx| {
                 let workspace_entity = cx.entity();
                 let diff_view = cx.new(|cx| {
+                    let title = title_for_buffers(&old_buffer, &new_buffer, cx);
+                    let tooltip = tooltip_for_buffers(&old_buffer, &new_buffer, cx);
                     FileDiffView::new(
-                        old_buffer,
+                        Some(old_buffer),
                         new_buffer,
                         buffer_diff,
                         project.clone(),
                         workspace_entity,
+                        title,
+                        tooltip,
+                        true,
                         window,
                         cx,
                     )
@@ -81,12 +88,61 @@ impl FileDiffView {
         })
     }
 
+    pub fn open_existing_diff(
+        new_buffer: Entity<Buffer>,
+        diff: Entity<BufferDiff>,
+        base_label: SharedString,
+        project: Entity<Project>,
+        workspace: WeakEntity<Workspace>,
+        split: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Entity<Self>>> {
+        window.spawn(cx, async move |cx| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                let workspace_entity = cx.entity();
+                let filename = filename_for_buffer(&new_buffer, cx);
+                let path = path_for_buffer(&new_buffer, cx);
+                let title = format!("{} ↔ {}", base_label, filename).into();
+                let tooltip = Some(format!("{} ↔ {}", base_label, path).into());
+                let diff_view = cx.new(|cx| {
+                    FileDiffView::new(
+                        None,
+                        new_buffer,
+                        diff,
+                        project,
+                        workspace_entity,
+                        title,
+                        tooltip,
+                        false,
+                        window,
+                        cx,
+                    )
+                });
+
+                let pane = if split {
+                    workspace.adjacent_pane(window, cx)
+                } else {
+                    workspace.active_pane().clone()
+                };
+                pane.update(cx, |pane, cx| {
+                    pane.add_item(Box::new(diff_view.clone()), true, true, None, window, cx);
+                });
+
+                diff_view
+            })
+        })
+    }
+
     pub fn new(
-        old_buffer: Entity<Buffer>,
+        old_buffer: Option<Entity<Buffer>>,
         new_buffer: Entity<Buffer>,
         diff: Entity<BufferDiff>,
         project: Entity<Project>,
         workspace: Entity<Workspace>,
+        title: SharedString,
+        tooltip: Option<SharedString>,
+        recalculate_diff_on_buffer_change: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -113,24 +169,24 @@ impl FileDiffView {
 
         let (buffer_changes_tx, mut buffer_changes_rx) = watch::channel(());
 
-        for buffer in [&old_buffer, &new_buffer] {
-            cx.subscribe(buffer, move |this, _, event, _| match event {
-                language::BufferEvent::Edited { .. }
-                | language::BufferEvent::LanguageChanged(_)
-                | language::BufferEvent::Reparsed => {
-                    this.buffer_changes_tx.send(()).ok();
+        if recalculate_diff_on_buffer_change {
+            if let Some(old_buffer) = &old_buffer {
+                for buffer in [old_buffer, &new_buffer] {
+                    cx.subscribe(buffer, move |this, _, event, _| match event {
+                        language::BufferEvent::Edited { .. }
+                        | language::BufferEvent::LanguageChanged(_)
+                        | language::BufferEvent::Reparsed => {
+                            this.buffer_changes_tx.send(()).ok();
+                        }
+                        _ => {}
+                    })
+                    .detach();
                 }
-                _ => {}
-            })
-            .detach();
+            }
         }
 
-        Self {
-            editor,
-            buffer_changes_tx,
-            old_buffer,
-            new_buffer,
-            _recalculate_diff_task: cx.spawn(async move |this, cx| {
+        let recalculate_diff_task = if recalculate_diff_on_buffer_change {
+            cx.spawn(async move |this, cx| {
                 while buffer_changes_rx.recv().await.is_ok() {
                     loop {
                         let mut timer = cx
@@ -146,11 +202,15 @@ impl FileDiffView {
 
                     log::trace!("start recalculating");
                     let (old_snapshot, new_snapshot) = this.update(cx, |this, cx| {
-                        (
-                            this.old_buffer.read(cx).snapshot(),
+                        let old_buffer = this
+                            .old_buffer
+                            .as_ref()
+                            .context("missing old buffer for recalculating file diff")?;
+                        Ok::<_, anyhow::Error>((
+                            old_buffer.read(cx).snapshot(),
                             this.new_buffer.read(cx).snapshot(),
-                        )
-                    })?;
+                        ))
+                    })??;
                     diff.update(cx, |diff, cx| {
                         diff.set_base_text(
                             Some(old_snapshot.text().as_str().into()),
@@ -164,9 +224,65 @@ impl FileDiffView {
                     log::trace!("finish recalculating");
                 }
                 Ok(())
-            }),
+            })
+        } else {
+            Task::ready(Ok(()))
+        };
+
+        Self {
+            editor,
+            buffer_changes_tx,
+            old_buffer,
+            new_buffer,
+            title,
+            tooltip,
+            _recalculate_diff_task: recalculate_diff_task,
         }
     }
+}
+
+fn filename_for_buffer(buffer: &Entity<Buffer>, cx: &App) -> String {
+    buffer
+        .read(cx)
+        .file()
+        .and_then(|file| file.full_path(cx).file_name()?.to_str().map(str::to_owned))
+        .unwrap_or_else(|| "untitled".into())
+}
+
+fn path_for_buffer(buffer: &Entity<Buffer>, cx: &App) -> String {
+    buffer
+        .read(cx)
+        .file()
+        .map(|file| file.full_path(cx).compact().to_string_lossy().into_owned())
+        .unwrap_or_else(|| "untitled".into())
+}
+
+fn title_for_buffers(
+    old_buffer: &Entity<Buffer>,
+    new_buffer: &Entity<Buffer>,
+    cx: &App,
+) -> SharedString {
+    format!(
+        "{} ↔ {}",
+        filename_for_buffer(old_buffer, cx),
+        filename_for_buffer(new_buffer, cx)
+    )
+    .into()
+}
+
+fn tooltip_for_buffers(
+    old_buffer: &Entity<Buffer>,
+    new_buffer: &Entity<Buffer>,
+    cx: &App,
+) -> Option<SharedString> {
+    Some(
+        format!(
+            "{} ↔ {}",
+            path_for_buffer(old_buffer, cx),
+            path_for_buffer(new_buffer, cx)
+        )
+        .into(),
+    )
 }
 
 #[ztracing::instrument(skip_all)]
@@ -231,39 +347,12 @@ impl Item for FileDiffView {
             .into_any_element()
     }
 
-    fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
-        let title_text = |buffer: &Entity<Buffer>| {
-            buffer
-                .read(cx)
-                .file()
-                .and_then(|file| {
-                    Some(
-                        file.full_path(cx)
-                            .file_name()?
-                            .to_string_lossy()
-                            .to_string(),
-                    )
-                })
-                .unwrap_or_else(|| "untitled".into())
-        };
-        let old_filename = title_text(&self.old_buffer);
-        let new_filename = title_text(&self.new_buffer);
-
-        format!("{old_filename} ↔ {new_filename}").into()
+    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        self.title.clone()
     }
 
-    fn tab_tooltip_text(&self, cx: &App) -> Option<ui::SharedString> {
-        let path = |buffer: &Entity<Buffer>| {
-            buffer
-                .read(cx)
-                .file()
-                .map(|file| file.full_path(cx).compact().to_string_lossy().into_owned())
-                .unwrap_or_else(|| "untitled".into())
-        };
-        let old_path = path(&self.old_buffer);
-        let new_path = path(&self.new_buffer);
-
-        Some(format!("{old_path} ↔ {new_path}").into())
+    fn tab_tooltip_text(&self, _cx: &App) -> Option<ui::SharedString> {
+        self.tooltip.clone()
     }
 
     fn to_item_events(event: &EditorEvent, f: &mut dyn FnMut(ItemEvent)) {
