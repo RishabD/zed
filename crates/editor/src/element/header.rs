@@ -625,12 +625,6 @@ pub(crate) fn render_buffer_header(
     cx: &mut App,
 ) -> impl IntoElement {
     let buffer_id = for_excerpt.buffer_id();
-    let header_hovered_state = window.use_keyed_state(
-        ("buffer-header-hovered", buffer_id.to_proto()),
-        cx,
-        |_, _| false,
-    );
-    let header_hovered = *header_hovered_state.read(cx);
     let editor_read = editor.read(cx);
     let multi_buffer = editor_read.buffer.read(cx);
     let is_read_only = editor_read.read_only(cx);
@@ -692,19 +686,8 @@ pub(crate) fn render_buffer_header(
         cx.theme().window_background_appearance() == WindowBackgroundAppearance::Opaque;
     let show_header_background = opaque_window || colors.editor_subheader_background.is_opaque();
 
-    let show_open_file_button =
-        can_open_excerpts && relative_path.is_some() && (is_selected || header_hovered);
-
     let header = div()
         .id(("buffer-header", buffer_id.to_proto()))
-        .on_hover(move |hovered, _window, cx| {
-            header_hovered_state.update(cx, |state, cx| {
-                if *state != *hovered {
-                    *state = *hovered;
-                    cx.notify();
-                }
-            });
-        })
         .p(BUFFER_HEADER_PADDING)
         .w_full()
         .h(FILE_HEADER_HEIGHT as f32 * window.line_height())
@@ -917,14 +900,40 @@ pub(crate) fn render_buffer_header(
                                     let ui_font_size =
                                         theme_settings::ThemeSettings::get_global(cx)
                                             .ui_font_size(cx);
-                                    this.child(WithRemSize::new(ui_font_size).child(DiffStat::new(
-                                        ("buffer-header-diff-stat", buffer_id.to_proto()),
-                                        added as usize,
-                                        removed as usize,
-                                    )))
-                                })
-                                .when(show_open_file_button, |this| {
                                     this.child(
+                                        WithRemSize::new(ui_font_size).child(
+                                            DiffStat::new(
+                                                ("buffer-header-diff-stat", buffer_id.to_proto()),
+                                                added as usize,
+                                                removed as usize,
+                                            )
+                                            .label_size(LabelSize::Small),
+                                        ),
+                                    )
+                                }),
+                        )
+                        .when(can_open_excerpts && relative_path.is_some(), |this| {
+                            let trailing_controls = editor_read
+                                .addons
+                                .values()
+                                .filter_map(|addon| {
+                                    addon.render_buffer_header_trailing_controls(
+                                        for_excerpt,
+                                        buffer,
+                                        window,
+                                        cx,
+                                    )
+                                })
+                                .take(1);
+
+                            this.child(
+                                h_flex()
+                                    .gap_1()
+                                    .when(!is_selected, |this| {
+                                        this.visible_on_hover("buffer-header-group")
+                                    })
+                                    .children(trailing_controls)
+                                    .child(
                                         Button::new("open-file-button", "Open File")
                                             .style(ButtonStyle::OutlinedCustom(
                                                 cx.theme().colors().border.opacity(0.6),
@@ -948,9 +957,9 @@ pub(crate) fn render_buffer_header(
                                                     );
                                                 }
                                             })),
-                                    )
-                                }),
-                        )
+                                    ),
+                            )
+                        })
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(window.listener_for(editor, {
                             let buffer_id = for_excerpt.buffer_id();

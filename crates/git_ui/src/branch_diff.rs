@@ -8,16 +8,21 @@ use crate::{
 };
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
+use buffer_diff::BufferDiff;
 use editor::{
     Addon, Editor, EditorEvent, RestoreOnlyDiffHunkDelegate, SplittableEditor,
     actions::SendReviewToAgent,
 };
-use git::{repository::DiffType, status::FileStatus};
-use gpui::{
-    Action, App, AppContext as _, Entity, EventEmitter, FocusHandle, Focusable, Render,
-    SharedString, Subscription, Task, WeakEntity,
+use git::{
+    repository::{DiffType, RepoPath},
+    status::FileStatus,
 };
-use language::{BufferId, Capability};
+use gpui::{
+    Action, AnyElement, App, AppContext as _, Entity, EventEmitter, FocusHandle, Focusable, Font,
+    Render, SharedString, Subscription, Task, WeakEntity,
+};
+use language::{Buffer, BufferId, Capability, HighlightedText};
+use multi_buffer::MultiBuffer;
 use project::{
     Project, ProjectPath,
     git_store::{
@@ -25,12 +30,13 @@ use project::{
         diff_buffer_list::{self, DiffBase},
     },
 };
-use settings::{GitDiffBaseSetting, Settings};
+use settings::{DiffViewStyle, GitDiffBaseSetting, Settings};
 use std::{
     any::{Any, TypeId},
     sync::Arc,
 };
 use ui::{DiffStat, Divider, PopoverMenu, Tooltip, prelude::*};
+use util::paths::{PathExt as _, PathStyle};
 use workspace::{
     ItemHandle, ItemNavHistory, SerializableItem, ToolbarItemEvent, ToolbarItemLocation,
     ToolbarItemView, Workspace,
@@ -54,6 +60,7 @@ pub struct BranchDiff {
 
 struct BranchDiffAddon {
     branch_diff: Entity<diff_buffer_list::DiffBufferList>,
+    view: WeakEntity<BranchDiff>,
 }
 
 impl Addon for BranchDiffAddon {
@@ -65,6 +72,40 @@ impl Addon for BranchDiffAddon {
         self.branch_diff
             .read(cx)
             .status_for_buffer_id(buffer_id, cx)
+    }
+
+    fn render_buffer_header_trailing_controls(
+        &self,
+        _excerpt_info: &multi_buffer::ExcerptBoundaryInfo,
+        buffer: &language::BufferSnapshot,
+        _window: &Window,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        let view = self.view.upgrade()?;
+        let workspace = view.read(cx).workspace.clone();
+        let buffer_id = buffer.remote_id();
+        if !view.read(cx).can_open_file_diff(buffer_id, cx) {
+            return None;
+        }
+
+        let view = self.view.clone();
+        Some(
+            Button::new("open-branch-file-diff-button", "Open Diff")
+                .style(ButtonStyle::OutlinedGhost)
+                .on_click(move |_, window, cx| {
+                    let task = window.spawn(cx, {
+                        let view = view.clone();
+                        async move |cx| {
+                            view.update_in(cx, |view, window, cx| {
+                                view.open_file_diff(buffer_id, window, cx)
+                            })??;
+                            anyhow::Ok(())
+                        }
+                    });
+                    task.detach_and_notify_err(workspace.clone(), window, cx);
+                })
+                .into_any_element(),
+        )
     }
 }
 
@@ -320,6 +361,7 @@ impl BranchDiff {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let view = cx.weak_entity();
         let branch_diff = branch_diff.unwrap_or_else(|| {
             let git_store = project.read(cx).git_store().clone();
             cx.new(|cx| {
@@ -343,6 +385,7 @@ impl BranchDiff {
                         rhs_editor.set_read_only(false);
                         rhs_editor.register_addon(BranchDiffAddon {
                             branch_diff: branch_diff_for_addon,
+                            view,
                         });
                     });
                 },
@@ -386,6 +429,45 @@ impl BranchDiff {
                 branch_diff.set_diff_base(DiffBase::Merge { base_ref }, cx);
             });
         });
+    }
+
+    fn can_open_file_diff(&self, buffer_id: BufferId, cx: &App) -> bool {
+        self.diff.read(cx).buffer_diff_data(buffer_id, cx).is_some()
+    }
+
+    fn open_file_diff(
+        &mut self,
+        buffer_id: BufferId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let DiffBase::Merge { base_ref } = self.diff_base(cx).clone() else {
+            return Err(anyhow!("Open Diff is only available for branch diffs"));
+        };
+        let workspace = self
+            .workspace
+            .upgrade()
+            .context("Could not open branch file diff because the workspace was closed")?;
+        let repository = self
+            .repo(cx)
+            .context("Could not open branch file diff because there is no active repository")?;
+        let (buffer, diff, repo_path) =
+            self.diff.read(cx).buffer_diff_data(buffer_id, cx).context(
+                "Could not open branch file diff because the diff data is no longer loaded",
+            )?;
+
+        BranchFileDiffView::open_or_focus(
+            repository,
+            repo_path,
+            base_ref,
+            buffer,
+            diff,
+            self.project.clone(),
+            workspace,
+            window,
+            cx,
+        );
+        Ok(())
     }
 
     fn review_diff(&mut self, _: &ReviewDiff, window: &mut Window, cx: &mut Context<Self>) {
@@ -434,6 +516,286 @@ impl BranchDiff {
     #[cfg(any(test, feature = "test-support"))]
     pub fn editor(&self, cx: &App) -> Entity<SplittableEditor> {
         self.diff.read(cx).editor().clone()
+    }
+}
+
+struct BranchFileDiffView {
+    repository: Entity<Repository>,
+    repo_path: RepoPath,
+    base_ref: SharedString,
+    buffer: Entity<Buffer>,
+    editor: Entity<SplittableEditor>,
+}
+
+impl BranchFileDiffView {
+    fn open_or_focus(
+        repository: Entity<Repository>,
+        repo_path: RepoPath,
+        base_ref: SharedString,
+        buffer: Entity<Buffer>,
+        diff: Entity<BufferDiff>,
+        project: Entity<Project>,
+        workspace: Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<BranchDiff>,
+    ) -> Entity<Self> {
+        let existing = workspace.read(cx).items_of_type::<Self>(cx).find(|item| {
+            item.read(cx)
+                .matches(&repository, &repo_path, &base_ref, cx)
+        });
+
+        if let Some(existing) = existing {
+            workspace.update(cx, |workspace, cx| {
+                workspace.activate_item(&existing, true, true, window, cx);
+            });
+            existing.focus_handle(cx).focus(window, cx);
+            return existing;
+        }
+
+        let view = cx.new(|cx| {
+            Self::new(
+                repository,
+                repo_path,
+                base_ref,
+                buffer,
+                diff,
+                project,
+                workspace.clone(),
+                window,
+                cx,
+            )
+        });
+        workspace.update(cx, |workspace, cx| {
+            workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+        });
+        view.focus_handle(cx).focus(window, cx);
+        view
+    }
+
+    fn new(
+        repository: Entity<Repository>,
+        repo_path: RepoPath,
+        base_ref: SharedString,
+        buffer: Entity<Buffer>,
+        diff: Entity<BufferDiff>,
+        project: Entity<Project>,
+        workspace: Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let multibuffer = cx.new(|cx| {
+            let mut multibuffer = MultiBuffer::singleton(buffer.clone(), cx);
+            multibuffer.add_diff(diff, cx);
+            multibuffer.set_all_diff_hunks_expanded(cx);
+            multibuffer
+        });
+        let editor = cx.new(|cx| {
+            let editor = SplittableEditor::new(
+                DiffViewStyle::Split,
+                multibuffer,
+                project,
+                workspace,
+                window,
+                cx,
+            );
+            editor.set_diff_hunk_delegate(Some(Arc::new(RestoreOnlyDiffHunkDelegate)), cx);
+            editor.rhs_editor().update(cx, |editor, cx| {
+                editor.set_should_serialize(false, cx);
+            });
+            editor
+        });
+
+        Self {
+            repository,
+            repo_path,
+            base_ref,
+            buffer,
+            editor,
+        }
+    }
+
+    fn matches(
+        &self,
+        repository: &Entity<Repository>,
+        repo_path: &RepoPath,
+        base_ref: &SharedString,
+        cx: &App,
+    ) -> bool {
+        self.repository.read(cx).id == repository.read(cx).id
+            && &self.repo_path == repo_path
+            && &self.base_ref == base_ref
+    }
+
+    fn path_display(&self, cx: &App) -> String {
+        self.buffer
+            .read(cx)
+            .file()
+            .map(|file| file.full_path(cx).compact().to_string_lossy().into_owned())
+            .unwrap_or_else(|| {
+                self.repo_path
+                    .as_ref()
+                    .display(PathStyle::local())
+                    .into_owned()
+            })
+    }
+}
+
+impl EventEmitter<EditorEvent> for BranchFileDiffView {}
+
+impl Focusable for BranchFileDiffView {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl Item for BranchFileDiffView {
+    type Event = EditorEvent;
+
+    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
+        Some(Icon::new(IconName::Diff).color(Color::Muted))
+    }
+
+    fn tab_content(&self, params: TabContentParams, _window: &Window, cx: &App) -> AnyElement {
+        Label::new(self.tab_content_text(params.detail.unwrap_or_default(), cx))
+            .color(if params.selected {
+                Color::Default
+            } else {
+                Color::Muted
+            })
+            .into_any_element()
+    }
+
+    fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
+        self.buffer
+            .read(cx)
+            .file()
+            .and_then(|file| {
+                Some(
+                    file.full_path(cx)
+                        .file_name()?
+                        .to_string_lossy()
+                        .to_string(),
+                )
+            })
+            .unwrap_or_else(|| {
+                self.repo_path
+                    .as_ref()
+                    .display(PathStyle::local())
+                    .into_owned()
+            })
+            .into()
+    }
+
+    fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
+        Some(format!("{} against {}", self.path_display(cx), self.base_ref).into())
+    }
+
+    fn to_item_events(event: &EditorEvent, f: &mut dyn FnMut(ItemEvent)) {
+        Editor::to_item_events(event, f)
+    }
+
+    fn telemetry_event_text(&self) -> Option<&'static str> {
+        Some("Branch File Diff Opened")
+    }
+
+    fn deactivated(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor.deactivated(window, cx);
+    }
+
+    fn act_as_type<'a>(
+        &'a self,
+        type_id: TypeId,
+        self_handle: &'a Entity<Self>,
+        cx: &'a App,
+    ) -> Option<gpui::AnyEntity> {
+        if type_id == TypeId::of::<Self>() {
+            Some(self_handle.clone().into())
+        } else {
+            self.editor.act_as_type(type_id, cx)
+        }
+    }
+
+    fn as_searchable(&self, _: &Entity<Self>, _: &App) -> Option<Box<dyn SearchableItemHandle>> {
+        Some(Box::new(self.editor.clone()))
+    }
+
+    fn for_each_project_item(
+        &self,
+        cx: &App,
+        f: &mut dyn FnMut(gpui::EntityId, &dyn project::ProjectItem),
+    ) {
+        self.editor.for_each_project_item(cx, f)
+    }
+
+    fn active_project_path(&self, cx: &App) -> Option<ProjectPath> {
+        self.editor.read(cx).active_project_path(cx)
+    }
+
+    fn set_nav_history(
+        &mut self,
+        nav_history: ItemNavHistory,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor.update(cx, |editor, cx| {
+            editor.rhs_editor().update(cx, |editor, _| {
+                editor.set_nav_history(Some(nav_history));
+            })
+        });
+    }
+
+    fn navigate(
+        &mut self,
+        data: Arc<dyn Any + Send>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.editor.update(cx, |editor, cx| {
+            editor
+                .rhs_editor()
+                .update(cx, |editor, cx| editor.navigate(data, window, cx))
+        })
+    }
+
+    fn breadcrumb_location(&self, _: &App) -> ToolbarItemLocation {
+        ToolbarItemLocation::PrimaryLeft
+    }
+
+    fn breadcrumbs(&self, cx: &App) -> Option<(Vec<HighlightedText>, Option<Font>)> {
+        self.editor.breadcrumbs(cx)
+    }
+
+    fn added_to_workspace(
+        &mut self,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor.update(cx, |editor, cx| {
+            editor.rhs_editor().update(cx, |editor, cx| {
+                editor.added_to_workspace(workspace, window, cx)
+            })
+        });
+    }
+
+    fn can_save(&self, cx: &App) -> bool {
+        self.editor.read(cx).rhs_editor().read(cx).can_save(cx)
+    }
+
+    fn save(
+        &mut self,
+        options: SaveOptions,
+        project: Entity<Project>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.editor.save(options, project, window, cx)
+    }
+}
+
+impl Render for BranchFileDiffView {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.editor.clone()
     }
 }
 
@@ -911,6 +1273,7 @@ impl Render for BranchDiffToolbar {
 mod tests {
     use anyhow::anyhow;
     use collections::HashMap;
+    use db::indoc;
     use editor::test::editor_test_context::assert_state_with_diff;
     use git::status::{FileStatus, TrackedStatus, UnmergedStatus, UnmergedStatusCode};
     use gpui::TestAppContext;
@@ -941,6 +1304,27 @@ mod tests {
             editor::init(cx);
             crate::init(cx);
         });
+    }
+
+    fn buffer_id_for_path(
+        branch_diff: &Entity<BranchDiff>,
+        path: &RelPath,
+        cx: &mut TestAppContext,
+    ) -> BufferId {
+        branch_diff.read_with(cx, |branch_diff, cx| {
+            let editor = branch_diff.editor(cx).read(cx).rhs_editor().clone();
+            editor
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .all_buffers_iter()
+                .find_map(|buffer| {
+                    let buffer = buffer.read(cx);
+                    let file = buffer.file()?;
+                    (file.path().as_ref() == path).then(|| buffer.remote_id())
+                })
+                .expect("expected diff buffer for path")
+        })
     }
 
     #[gpui::test(iterations = 50)]
@@ -1193,6 +1577,145 @@ mod tests {
                 )
             ])
         );
+    }
+
+    #[gpui::test]
+    async fn test_open_branch_file_diff(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let base_contents = indoc!(
+            "
+            one
+            two
+            three
+            four
+            five
+            six
+            seven
+            eight
+            nine
+            ten
+            eleven
+            twelve
+            "
+        );
+        let current_contents = indoc!(
+            "
+            one
+            two
+            three
+            four
+            five
+            SIX
+            seven
+            eight
+            nine
+            ten
+            eleven
+            twelve
+            "
+        );
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "foo.txt": current_contents,
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let repository = project
+            .read_with(cx, |project, cx| project.active_repository(cx))
+            .expect("expected active repository");
+
+        let diff = cx
+            .update(|window, cx| {
+                BranchDiff::new_with_branch_base(
+                    project.clone(),
+                    workspace.clone(),
+                    "origin/main".into(),
+                    repository,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("branch diff should open");
+        cx.run_until_parked();
+
+        fs.set_head_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("foo.txt", current_contents.to_owned())],
+            "sha",
+        );
+        fs.set_merge_base_content_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("foo.txt", base_contents.to_owned())],
+        );
+        cx.run_until_parked();
+
+        let buffer_id = buffer_id_for_path(&diff, rel_path("foo.txt"), cx);
+        assert!(diff.read_with(cx, |diff, cx| diff.can_open_file_diff(buffer_id, cx)));
+
+        diff.update_in(cx, |diff, window, cx| {
+            diff.open_file_diff(buffer_id, window, cx)
+        })
+        .expect("branch file diff should open");
+        cx.run_until_parked();
+
+        let branch_file_diff = workspace.update(cx, |workspace, cx| {
+            workspace
+                .active_item_as::<BranchFileDiffView>(cx)
+                .expect("branch file diff should be active")
+        });
+        let first_branch_file_diff_id = branch_file_diff.entity_id();
+        let (diff_view_style, is_split, editor) =
+            branch_file_diff.read_with(cx, |branch_file_diff, cx| {
+                let editor = branch_file_diff.editor.read(cx);
+                (
+                    editor.diff_view_style(),
+                    editor.is_split(),
+                    editor.rhs_editor().clone(),
+                )
+            });
+        assert_eq!(diff_view_style, DiffViewStyle::Split);
+        assert!(is_split);
+        assert_eq!(
+            editor.read_with(cx, |editor, cx| editor.text(cx)),
+            current_contents
+        );
+        assert_eq!(
+            editor.read_with(cx, |editor, cx| {
+                editor.buffer().read(cx).snapshot(cx).total_changed_lines()
+            }),
+            (1, 1)
+        );
+
+        diff.update_in(cx, |diff, window, cx| {
+            diff.open_file_diff(buffer_id, window, cx)
+        })
+        .expect("branch file diff should focus existing item");
+        cx.run_until_parked();
+
+        let active_branch_file_diff = workspace.update(cx, |workspace, cx| {
+            workspace
+                .active_item_as::<BranchFileDiffView>(cx)
+                .expect("branch file diff should still be active")
+        });
+        let branch_file_diff_count = workspace.update(cx, |workspace, cx| {
+            workspace.items_of_type::<BranchFileDiffView>(cx).count()
+        });
+        assert_eq!(
+            active_branch_file_diff.entity_id(),
+            first_branch_file_diff_id
+        );
+        assert_eq!(branch_file_diff_count, 1);
     }
 
     #[gpui::test]

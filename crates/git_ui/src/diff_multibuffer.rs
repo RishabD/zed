@@ -204,6 +204,24 @@ impl DiffMultibuffer {
         &self.multibuffer
     }
 
+    pub(crate) fn buffer_diff_data(
+        &self,
+        buffer_id: BufferId,
+        cx: &App,
+    ) -> Option<(Entity<Buffer>, Entity<BufferDiff>, RepoPath)> {
+        let (repo_path, subscriptions) =
+            self.buffer_subscriptions
+                .iter()
+                .find(|(_, subscriptions)| {
+                    subscriptions.display_buffer.read(cx).remote_id() == buffer_id
+                })?;
+        Some((
+            subscriptions.display_buffer.clone(),
+            subscriptions._diff.clone(),
+            repo_path.clone(),
+        ))
+    }
+
     pub(crate) fn move_to_entry(
         &mut self,
         entry: GitStatusEntry,
