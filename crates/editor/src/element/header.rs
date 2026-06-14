@@ -913,18 +913,15 @@ pub(crate) fn render_buffer_header(
                                 }),
                         )
                         .when(can_open_excerpts && relative_path.is_some(), |this| {
-                            let trailing_controls = editor_read
-                                .addons
-                                .values()
-                                .filter_map(|addon| {
+                            let trailing_controls =
+                                editor_read.addons.values().filter_map(|addon| {
                                     addon.render_buffer_header_trailing_controls(
                                         for_excerpt,
                                         buffer,
                                         window,
                                         cx,
                                     )
-                                })
-                                .take(1);
+                                });
 
                             this.child(
                                 h_flex()

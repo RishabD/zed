@@ -96,9 +96,11 @@ impl Addon for BranchDiffAddon {
                     let task = window.spawn(cx, {
                         let view = view.clone();
                         async move |cx| {
-                            view.update_in(cx, |view, window, cx| {
-                                view.open_file_diff(buffer_id, window, cx)
-                            })??;
+                            let file_diff =
+                                view.update(cx, |view, cx| view.file_diff_to_open(buffer_id, cx))??;
+                            cx.update(|window, cx| {
+                                BranchFileDiffView::open_or_focus(file_diff, window, cx);
+                            })?;
                             anyhow::Ok(())
                         }
                     });
@@ -435,12 +437,7 @@ impl BranchDiff {
         self.diff.read(cx).buffer_diff_data(buffer_id, cx).is_some()
     }
 
-    fn open_file_diff(
-        &mut self,
-        buffer_id: BufferId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Result<()> {
+    fn file_diff_to_open(&self, buffer_id: BufferId, cx: &App) -> Result<BranchFileDiffToOpen> {
         let DiffBase::Merge { base_ref } = self.diff_base(cx).clone() else {
             return Err(anyhow!("Open Diff is only available for branch diffs"));
         };
@@ -456,18 +453,15 @@ impl BranchDiff {
                 "Could not open branch file diff because the diff data is no longer loaded",
             )?;
 
-        BranchFileDiffView::open_or_focus(
+        Ok(BranchFileDiffToOpen {
             repository,
             repo_path,
             base_ref,
             buffer,
             diff,
-            self.project.clone(),
+            project: self.project.clone(),
             workspace,
-            window,
-            cx,
-        );
-        Ok(())
+        })
     }
 
     fn review_diff(&mut self, _: &ReviewDiff, window: &mut Window, cx: &mut Context<Self>) {
@@ -519,6 +513,16 @@ impl BranchDiff {
     }
 }
 
+struct BranchFileDiffToOpen {
+    repository: Entity<Repository>,
+    repo_path: RepoPath,
+    base_ref: SharedString,
+    buffer: Entity<Buffer>,
+    diff: Entity<BufferDiff>,
+    project: Entity<Project>,
+    workspace: Entity<Workspace>,
+}
+
 struct BranchFileDiffView {
     repository: Entity<Repository>,
     repo_path: RepoPath,
@@ -529,16 +533,19 @@ struct BranchFileDiffView {
 
 impl BranchFileDiffView {
     fn open_or_focus(
-        repository: Entity<Repository>,
-        repo_path: RepoPath,
-        base_ref: SharedString,
-        buffer: Entity<Buffer>,
-        diff: Entity<BufferDiff>,
-        project: Entity<Project>,
-        workspace: Entity<Workspace>,
+        file_diff: BranchFileDiffToOpen,
         window: &mut Window,
-        cx: &mut Context<BranchDiff>,
+        cx: &mut App,
     ) -> Entity<Self> {
+        let BranchFileDiffToOpen {
+            repository,
+            repo_path,
+            base_ref,
+            buffer,
+            diff,
+            project,
+            workspace,
+        } = file_diff;
         let existing = workspace.read(cx).items_of_type::<Self>(cx).find(|item| {
             item.read(cx)
                 .matches(&repository, &repo_path, &base_ref, cx)
@@ -655,27 +662,14 @@ impl Item for BranchFileDiffView {
         Some(Icon::new(IconName::Diff).color(Color::Muted))
     }
 
-    fn tab_content(&self, params: TabContentParams, _window: &Window, cx: &App) -> AnyElement {
-        Label::new(self.tab_content_text(params.detail.unwrap_or_default(), cx))
-            .color(if params.selected {
-                Color::Default
-            } else {
-                Color::Muted
-            })
-            .into_any_element()
-    }
-
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
         self.buffer
             .read(cx)
             .file()
             .and_then(|file| {
-                Some(
-                    file.full_path(cx)
-                        .file_name()?
-                        .to_string_lossy()
-                        .to_string(),
-                )
+                file.full_path(cx)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
             })
             .unwrap_or_else(|| {
                 self.repo_path
@@ -1588,31 +1582,13 @@ mod tests {
             one
             two
             three
-            four
-            five
-            six
-            seven
-            eight
-            nine
-            ten
-            eleven
-            twelve
             "
         );
         let current_contents = indoc!(
             "
             one
-            two
+            TWO
             three
-            four
-            five
-            SIX
-            seven
-            eight
-            nine
-            ten
-            eleven
-            twelve
             "
         );
 
@@ -1641,6 +1617,7 @@ mod tests {
                     workspace.clone(),
                     "origin/main".into(),
                     repository,
+                    None,
                     window,
                     cx,
                 )
@@ -1663,10 +1640,15 @@ mod tests {
         let buffer_id = buffer_id_for_path(&diff, rel_path("foo.txt"), cx);
         assert!(diff.read_with(cx, |diff, cx| diff.can_open_file_diff(buffer_id, cx)));
 
-        diff.update_in(cx, |diff, window, cx| {
-            diff.open_file_diff(buffer_id, window, cx)
-        })
-        .expect("branch file diff should open");
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(diff.clone()), None, true, window, cx);
+        });
+        let file_diff = diff
+            .read_with(cx, |diff, cx| diff.file_diff_to_open(buffer_id, cx))
+            .expect("branch file diff should open");
+        cx.update(|window, cx| {
+            BranchFileDiffView::open_or_focus(file_diff, window, cx);
+        });
         cx.run_until_parked();
 
         let branch_file_diff = workspace.update(cx, |workspace, cx| {
@@ -1697,10 +1679,12 @@ mod tests {
             (1, 1)
         );
 
-        diff.update_in(cx, |diff, window, cx| {
-            diff.open_file_diff(buffer_id, window, cx)
-        })
-        .expect("branch file diff should focus existing item");
+        let file_diff = diff
+            .read_with(cx, |diff, cx| diff.file_diff_to_open(buffer_id, cx))
+            .expect("branch file diff should focus existing item");
+        cx.update(|window, cx| {
+            BranchFileDiffView::open_or_focus(file_diff, window, cx);
+        });
         cx.run_until_parked();
 
         let active_branch_file_diff = workspace.update(cx, |workspace, cx| {

@@ -7284,6 +7284,40 @@ impl GitPanel {
         matches!(branch_name, "main" | "master")
     }
 
+    fn buffer_header_entry(
+        &self,
+        file: &Arc<dyn File>,
+        cx: &App,
+    ) -> Option<(Entity<Repository>, RepoPath, GitListEntry)> {
+        let repo = self.active_repository.clone()?;
+        let project_path = (file.worktree_id(cx), file.path().clone()).into();
+        let repo_path = repo.read(cx).project_path_to_repo_path(&project_path, cx)?;
+        let ix = self.entry_by_path(&repo_path)?;
+        let entry = self.entries.get(ix)?.clone();
+        Some((repo, repo_path, entry))
+    }
+
+    fn open_solo_diff_for_buffer_header_file(
+        &mut self,
+        file: Arc<dyn File>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        maybe!({
+            let (repository, _, entry) = self.buffer_header_entry(&file, cx)?;
+            let status_entry = entry.status_entry()?.clone();
+            SoloDiffView::open_or_focus(
+                status_entry,
+                repository,
+                self.workspace.clone(),
+                window,
+                cx,
+            )
+            .detach_and_notify_err(self.workspace.clone(), window, cx);
+            Some(())
+        });
+    }
+
     fn render_buffer_header_controls(
         &self,
         entity: &Entity<Self>,
@@ -7291,11 +7325,8 @@ impl GitPanel {
         _: &Window,
         cx: &App,
     ) -> Option<AnyElement> {
-        let repo = self.active_repository.as_ref()?.read(cx);
-        let project_path = (file.worktree_id(cx), file.path().clone()).into();
-        let repo_path = repo.project_path_to_repo_path(&project_path, cx)?;
-        let ix = self.entry_by_path(&repo_path)?;
-        let entry = self.entries.get(ix)?;
+        let (repository, repo_path, entry) = self.buffer_header_entry(file, cx)?;
+        let repo = repository.read(cx);
 
         let is_staging_or_staged = repo
             .pending_ops_for_path(&repo_path)
@@ -7315,7 +7346,6 @@ impl GitPanel {
             .fill()
             .elevation(ElevationIndex::Surface)
             .on_click({
-                let entry = entry.clone();
                 let git_panel = entity.downgrade();
                 move |_, window, cx| {
                     git_panel
@@ -8646,6 +8676,38 @@ impl editor::Addon for GitPanelAddon {
         git_panel
             .read(cx)
             .render_buffer_header_controls(&git_panel, file, window, cx)
+    }
+
+    fn render_buffer_header_trailing_controls(
+        &self,
+        _excerpt_info: &ExcerptBoundaryInfo,
+        buffer: &language::BufferSnapshot,
+        _window: &Window,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        let file = buffer.file()?.clone();
+        let git_panel = self.workspace.upgrade()?.read(cx).panel::<GitPanel>(cx)?;
+
+        git_panel
+            .read(cx)
+            .buffer_header_entry(&file, cx)?
+            .2
+            .status_entry()?;
+
+        let git_panel = git_panel.downgrade();
+        Some(
+            Button::new("open-git-panel-file-diff-button", "Open Diff")
+                .style(ButtonStyle::OutlinedGhost)
+                .on_click(move |_, window, cx| {
+                    git_panel
+                        .update(cx, |this, cx| {
+                            this.open_solo_diff_for_buffer_header_file(file.clone(), window, cx);
+                            cx.stop_propagation();
+                        })
+                        .ok();
+                })
+                .into_any_element(),
+        )
     }
 }
 
@@ -12017,6 +12079,99 @@ mod tests {
             assert!(panel.pending_remote_operation.is_none());
             assert!(panel.start_remote_operation(RemoteOperationKind::Pull, cx));
         });
+    }
+
+    #[gpui::test]
+    async fn test_open_solo_diff_from_uncommitted_project_diff_header(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "tracked": "tracked\n",
+            }),
+        )
+        .await;
+
+        fs.set_head_and_index_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("tracked", "old tracked\n".into())],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        let panel = workspace.update_in(cx, GitPanel::new);
+
+        cx.update_window_entity(&panel, |panel, _, _| {
+            std::mem::replace(&mut panel.update_visible_entries_task, Task::ready(()))
+        })
+        .await;
+
+        let tracked_ix = panel
+            .read_with(cx, |panel, _| panel.entry_by_path(&repo_path("tracked")))
+            .expect("tracked entry should exist");
+        panel.update_in(cx, |panel, window, cx| {
+            panel.selected_entry = Some(tracked_ix);
+            panel.open_diff(&menu::Confirm, window, cx);
+        });
+        cx.run_until_parked();
+
+        let file = workspace.update_in(cx, |workspace, _window, cx| {
+            let project_diff = workspace
+                .item_of_type::<ProjectDiff>(cx)
+                .expect("ProjectDiff should exist");
+            let editor = project_diff
+                .read(cx)
+                .editor(cx)
+                .read(cx)
+                .rhs_editor()
+                .clone();
+            let multibuffer = editor.read(cx).buffer().clone();
+            multibuffer
+                .read(cx)
+                .all_buffers_iter()
+                .find_map(|buffer| buffer.read(cx).file().cloned())
+                .expect("diff buffer should have a file")
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_solo_diff_for_buffer_header_file(file.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let solo_diff = workspace.update_in(cx, |workspace, _window, cx| {
+            workspace
+                .active_item_as::<SoloDiffView>(cx)
+                .expect("SoloDiffView should be active")
+        });
+        let first_solo_diff_id = solo_diff.entity_id();
+        let solo_diff_count = workspace.update_in(cx, |workspace, _window, cx| {
+            workspace.items_of_type::<SoloDiffView>(cx).count()
+        });
+        assert_eq!(solo_diff_count, 1);
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_solo_diff_for_buffer_header_file(file, window, cx);
+        });
+        cx.run_until_parked();
+
+        let active_solo_diff = workspace.update_in(cx, |workspace, _window, cx| {
+            workspace
+                .active_item_as::<SoloDiffView>(cx)
+                .expect("SoloDiffView should still be active")
+        });
+        let solo_diff_count = workspace.update_in(cx, |workspace, _window, cx| {
+            workspace.items_of_type::<SoloDiffView>(cx).count()
+        });
+        assert_eq!(active_solo_diff.entity_id(), first_solo_diff_id);
+        assert_eq!(solo_diff_count, 1);
     }
 
     #[gpui::test]
