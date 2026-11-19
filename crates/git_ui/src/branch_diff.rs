@@ -1644,20 +1644,19 @@ mod tests {
             .read_with(cx, |project, cx| project.active_repository(cx))
             .expect("expected active repository");
 
-        let diff = cx
-            .update(|window, cx| {
-                BranchDiff::new_with_branch_base(
+        let diff = cx.update(|window, cx| {
+            cx.new(|cx| {
+                BranchDiff::new_with_base_ref(
                     project.clone(),
                     workspace.clone(),
                     "origin/main".into(),
-                    repository,
+                    Some(repository),
                     None,
                     window,
                     cx,
                 )
             })
-            .await
-            .expect("branch diff should open");
+        });
         cx.run_until_parked();
 
         fs.set_head_for_repo(
